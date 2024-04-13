@@ -707,6 +707,8 @@ TEST(test_bplus_tree, test_scanner)
   ASSERT_EQ(RC::RECORD_EOF, rc);
 
   scanner.close();
+
+  handler->close();
 }
 
 TEST(test_bplus_tree, test_bplus_tree_insert)

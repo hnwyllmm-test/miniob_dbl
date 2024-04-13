@@ -244,6 +244,8 @@ public:
 
   int file_desc() const;
 
+  const char *filename() const { return file_name_.c_str(); }
+
   /**
    * 如果页面是脏的，就将数据刷新到double write buffer
    */
@@ -319,7 +321,8 @@ public:
   RC close_file(const char *file_name);
 
   RC flush_page(Frame &frame);
-  RC get_disk_buffer(const char *file_name, DiskBufferPool **buf);
+
+  DiskBufferPool *get_disk_buffer(const char *file_name);
 
   BPFrameManager    &get_frame_manager() { return frame_manager_; }
   DoubleWriteBuffer *get_dblwr_buffer() { return dblwr_buffer_; }
@@ -357,6 +360,25 @@ private:
   Page page_;
 };
 
+struct DoubleWritePageKey
+{
+  std::string file_name;
+  PageNum     page_num;
+
+  bool operator==(const DoubleWritePageKey &other) const
+  {
+    return file_name == other.file_name && page_num == other.page_num;
+  }
+};
+
+struct DoubleWritePageKeyHash
+{
+  size_t operator()(const DoubleWritePageKey &key) const
+  {
+    return std::hash<std::string>()(key.file_name) ^ std::hash<PageNum>()(key.page_num);
+  }
+};
+
 class DoubleWriteBuffer
 {
 public:
@@ -384,7 +406,7 @@ public:
    */
   RC write_page(DoubleWritePage *page);
 
-  RC get_disk_buffer(const char *file_name);
+  RC clear_pages(DiskBufferPool *bp);
 
   void clear_buffer();
 
@@ -403,9 +425,6 @@ private:
   int                            max_page_cnt_ = 0;
   common::Mutex                  lock_;
   BufferPoolManager             &bp_manager_;
-  std::vector<DoubleWritePage *> dblwr_pages_;
-
-  std::unordered_map<std::string, DoubleWritePage *> pages_;
-  std::unordered_map<std::string, DiskBufferPool *>  buffers_;
+  std::unordered_map<DoubleWritePageKey, DoubleWritePage *, DoubleWritePageKeyHash> dblwr_pages_;
   std::list<DiskBufferPool *>                        buffer_to_delete;
 };

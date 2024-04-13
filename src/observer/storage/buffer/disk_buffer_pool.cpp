@@ -273,6 +273,12 @@ RC DiskBufferPool::close_file()
     return rc;
   }
 
+  rc = dblwr_manager_.clear_pages(this);
+  if (OB_FAIL(rc)) {
+    LOG_WARN("failed to clear pages in double write buffer. filename=%s, rc=%s", file_name_.c_str(), strrc(rc));
+    return rc;
+  }
+
   disposed_pages_.clear();
 
   if (close(file_desc_) < 0) {
@@ -788,14 +794,13 @@ RC BufferPoolManager::flush_page(Frame &frame)
   return bp->flush_page(frame);
 }
 
-RC BufferPoolManager::get_disk_buffer(const char *file_name, DiskBufferPool **buf)
+DiskBufferPool *BufferPoolManager::get_disk_buffer(const char *file_name)
 {
-
-  if (buffer_pools_.count(file_name) != 0) {
-    *buf = buffer_pools_[file_name];
+  auto iter = buffer_pools_.find(file_name);
+  if (iter != buffer_pools_.end()) {
+    return iter->second;
   }
-
-  return RC::SUCCESS;
+  return nullptr;
 }
 
 static BufferPoolManager *default_bpm = nullptr;
@@ -813,8 +818,8 @@ DoubleWriteBuffer::DoubleWriteBuffer(BufferPoolManager &bp_manager) : bp_manager
 
 DoubleWriteBuffer::~DoubleWriteBuffer()
 {
-  for (auto page : dblwr_pages_) {
-    delete page;
+  for (auto &node : dblwr_pages_) {
+    delete node.second;
   }
   close(file_desc_);
 }
@@ -835,29 +840,18 @@ RC DoubleWriteBuffer::flush_page()
 {
   sync();
 
-  buffers_.clear();
-  for (const auto &page : dblwr_pages_) {
-    const char *file_name = page->get_file_name();
-
-    RC rc = get_disk_buffer(file_name);
-    if (rc != RC::SUCCESS) {
-      LOG_ERROR("failed to get disk buffer");
-      return rc;
-    }
-  }
-
-  for (const auto &page : dblwr_pages_) {
-    RC rc = write_page(page);
+  for (const auto &pair : dblwr_pages_) {
+    RC rc = write_page(pair.second);
     if (rc != RC::SUCCESS) {
       return rc;
     }
-    delete page;
+    delete pair.second;
   }
 
   clear_buffer();
 
   dblwr_pages_.clear();
-  pages_.clear();
+  buffer_to_delete.clear();
 
   return RC::SUCCESS;
 }
@@ -865,10 +859,11 @@ RC DoubleWriteBuffer::flush_page()
 RC DoubleWriteBuffer::add_page(const std::string &file_name, Page &page)
 {
   std::scoped_lock lock_guard(lock_);
-  string           key = file_name + to_string(page.page_num);
 
-  if (pages_.count(key) != 0) {
-    pages_.at(key)->get_page() = page;
+  DoubleWritePageKey key{file_name, page.page_num};
+  auto iter = dblwr_pages_.find(key);
+  if (iter != dblwr_pages_.end()) {
+    iter->second->get_page() = page;
     return RC::SUCCESS;
   }
 
@@ -882,7 +877,7 @@ RC DoubleWriteBuffer::add_page(const std::string &file_name, Page &page)
 
   int64_t          page_cnt   = dblwr_pages_.size();
   DoubleWritePage *dblwr_page = new DoubleWritePage((int)dblwr_pages_.size(), file_name, page);
-  dblwr_pages_.push_back(dblwr_page);
+  dblwr_pages_.insert(std::pair<DoubleWritePageKey, DoubleWritePage *>(key, dblwr_page));
 
   if (page_cnt + 1 > max_page_cnt_) {
     max_page_cnt_ = page_cnt + 1;
@@ -908,48 +903,50 @@ RC DoubleWriteBuffer::add_page(const std::string &file_name, Page &page)
     return RC::IOERR_WRITE;
   }
 
-  pages_[key] = dblwr_page;
+  return RC::SUCCESS;
+}
+
+RC DoubleWriteBuffer::clear_pages(DiskBufferPool *buffer_pool)
+{
+  vector<DoubleWritePage *> spec_pages;
+  
+  auto remove_pred = [&spec_pages, buffer_pool](const pair<DoubleWritePageKey, DoubleWritePage *> &pair) {
+    DoubleWritePage *dbl_page = pair.second;
+    if (0 == strcmp(buffer_pool->filename(), dbl_page->get_file_name())) {
+      spec_pages.push_back(dbl_page);
+      return true;
+    }
+    return false;
+  };
+
+  lock_.lock();
+  erase_if(dblwr_pages_, remove_pred);
+  lock_.unlock();
+
+  LOG_INFO("clear pages in double write buffer. file name=%s, page count=%d",
+           buffer_pool->filename(), spec_pages.size());
+
+  RC rc = RC::SUCCESS;
+  for (DoubleWritePage *dbl_page : spec_pages) {
+    rc = buffer_pool->write_page(dbl_page->get_page());
+    if (OB_FAIL(rc)) {
+      LOG_WARN("Failed to write page %s:%d to disk buffer pool. rc=%s",
+               buffer_pool->filename(), dbl_page->get_page().page_num, strrc(rc));
+      break;
+    }
+  }
+
+  ranges::for_each(spec_pages, [](DoubleWritePage *dbl_page) { delete dbl_page; });
 
   return RC::SUCCESS;
 }
 
 RC DoubleWriteBuffer::write_page(DoubleWritePage *dblwr_page)
 {
-  if (buffers_.count(dblwr_page->get_file_name()) == 0) {
-    LOG_ERROR("can't find disk buffer when write page");
-    return RC::IOERR_WRITE;
-  }
-
-  DiskBufferPool *disk_buffer = buffers_[dblwr_page->get_file_name()];
+  DiskBufferPool *disk_buffer = bp_manager_.get_disk_buffer(dblwr_page->get_file_name());
+  ASSERT(disk_buffer != nullptr, "failed to get disk buffer pool of %s", dblwr_page->get_file_name());
 
   return disk_buffer->write_page(dblwr_page->get_page());
-}
-
-RC DoubleWriteBuffer::get_disk_buffer(const char *file_name)
-{
-  if (buffers_.count(file_name) != 0) {
-    return RC::SUCCESS;
-  }
-
-  DiskBufferPool *disk_buffer = nullptr;
-  bp_manager_.get_disk_buffer(file_name, &disk_buffer);
-
-  /**
-   * 如果bpm中没有对应的DiskBufferPool，就创建一个新的DiskBufferPool。
-   * 调用bpm中open_file时，需要申请一个新的frame，而如果此时frame manager已满，需要purge page，会导致无限循环
-   */
-  if (disk_buffer == nullptr) {
-    disk_buffer = new DiskBufferPool(bp_manager_, bp_manager_.get_frame_manager(), *this);
-    RC rc       = disk_buffer->open_file_for_dwb(file_name);
-    if (rc != RC::SUCCESS) {
-      LOG_ERROR("failed to open file for dwb");
-      return rc;
-    }
-    buffer_to_delete.push_back(disk_buffer);
-  }
-  buffers_[file_name] = disk_buffer;
-
-  return RC::SUCCESS;
 }
 
 RC DoubleWriteBuffer::recover()
@@ -990,14 +987,8 @@ RC DoubleWriteBuffer::recover()
     }
 
     if (crc32(page.data, BP_PAGE_DATA_SIZE) == page.check_sum) {
-      RC rc = get_disk_buffer(dblwr_page->get_file_name());
-      if (rc != RC::SUCCESS) {
-        clear_buffer();
-        delete dblwr_page;
-        return rc;
-      }
 
-      rc = write_page(dblwr_page);
+      RC rc = write_page(dblwr_page);
       if (rc != RC::SUCCESS) {
         clear_buffer();
         delete dblwr_page;
@@ -1020,7 +1011,6 @@ void DoubleWriteBuffer::clear_buffer()
     delete buffer;
   }
 
-  buffers_.clear();
   buffer_to_delete.clear();
 }
 
@@ -1028,9 +1018,10 @@ std::optional<Page> DoubleWriteBuffer::get_page(const std::string &file_name, Pa
 {
   std::scoped_lock lock_guard(lock_);
 
-  string key = file_name + to_string(page_num);
-  if (pages_.count(key) != 0) {
-    return make_optional<Page>(pages_.at(key)->get_page());
+  DoubleWritePageKey key{file_name, page_num};
+  auto iter = dblwr_pages_.find(key);
+  if (iter != dblwr_pages_.end()) {
+    return make_optional<Page>(iter->second->get_page());
   }
 
   return std::nullopt;
